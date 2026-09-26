@@ -1,0 +1,22 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+chrome_session/
+postgres_data/
+session_cookies.json
+data/
+logs/
+*.log
+*.log.err
+*.sqlite
+*.sqlite3
+*.db
+*.xlsx
+~$*.xlsx
+
+# Áudio (ex: captchas)
+*.mp3
+*.wav
+*.ogg
+*.m4a
