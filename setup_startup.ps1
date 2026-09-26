@@ -1,5 +1,5 @@
 # ============================================================
-#  Vivo Smart Worker - Instalador da Tarefa de Startup
+#  Vivo Smart Cobertura Worker - Instalador da Tarefa de Startup
 #
 #  Execute UMA VEZ (clique direito > "Executar com o PowerShell",
 #  ou:  powershell -ExecutionPolicy Bypass -File setup_startup.ps1).
@@ -9,13 +9,13 @@
 #    2. Roda o bootstrap.ps1 -SkipWorker AGORA: instala winget deps,
 #       Python 3.12, cria a .venv, instala requirements e baixa o
 #       modelo Whisper. (Idempotente - pode rodar de novo sem medo.)
-#    3. Registra a Tarefa Agendada "VivoSmartWorker" que, a cada
+#    3. Registra a Tarefa Agendada "VivoSmartCoberturaWorker" que, a cada
 #       logon, executa startup_worker.vbs (oculto) -> bootstrap.ps1
 #       -> git pull -> atualiza deps se mudou -> inicia o worker.
 # ============================================================
 
 $ErrorActionPreference = "Stop"
-$TaskName   = "VivoSmartWorker"
+$TaskName   = "VivoSmartCoberturaWorker"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $VbsPath    = Join-Path $ProjectDir "startup_worker.vbs"
 $Bootstrap  = Join-Path $ProjectDir "bootstrap.ps1"
@@ -32,7 +32,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 Write-Host ""
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host "  Vivo Smart Worker - Setup de Startup" -ForegroundColor Cyan
+Write-Host "  Vivo Smart Cobertura Worker - Setup de Startup" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "[1/4] Projeto:  $ProjectDir"
@@ -73,7 +73,7 @@ $settings = New-ScheduledTaskSettingsSet `
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -RunLevel Limited `
-    -Description "Worker Vivo Smart APIs. No logon: git pull, atualiza deps se mudou, inicia o robo. Executa oculto." `
+    -Description "Worker Vivo Smart Cobertura (CEP + numero). No logon: git pull, atualiza deps se mudou, inicia o robo. Executa oculto." `
     -Force | Out-Null
 
 Write-Host ""

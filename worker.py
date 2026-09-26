@@ -10,16 +10,15 @@ import atexit
 import signal
 import requests
 import traceback
+import unicodedata
 from datetime import datetime
 from dotenv import load_dotenv
 
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException, ElementClickInterceptedException
 from loguru import logger
 
-# Carrega configurações locais do .env
+# Carrega configurações locais do .env (só conexão com o painel; credenciais
+# do robô vêm do painel, ver REQUIRED_ENV_KEYS abaixo)
 load_dotenv()
 
 # Log em arquivo (roda como servico oculto no startup, sem console visivel):
@@ -96,19 +95,26 @@ signal.signal(signal.SIGINT, _encerrar_navegador_ao_sair)
 if hasattr(signal, "SIGBREAK"):
     signal.signal(signal.SIGBREAK, _encerrar_navegador_ao_sair)
 
-# --- CONFIGURAÇÃO AUTOMÁTICA & DASHBOARD ---
-BASE_URL = os.getenv("API_BASE_URL", "http://192.168.100.2/workers").rstrip('/')
-QUEUE_SLUG = os.getenv("QUEUE_SLUG", "vivosimplifique1")
-QUEUE_TOKEN = os.getenv("QUEUE_TOKEN", "78d43d99-874c-49ee-b18f-5c0e5a766d76")
-WORKER_NAME = os.getenv("WORKER_NAME", "Worker-Python-01")
-MACHINE_NAME = socket.gethostname()
+# --- CONFIGURAÇÃO AUTOMÁTICA ---
+# Conexão com o painel. Fica no .env (e não fixa no código como no script da
+# aba "API & Integração") porque o mesmo código roda contra o painel de
+# produção e o de desenvolvimento, e o token muda entre os dois.
+BASE_URL = os.getenv("API_BASE_URL", "http://192.168.100.2/workers").rstrip('/')  # URL do seu Dashboard
+QUEUE_SLUG = os.getenv("QUEUE_SLUG", "vivosmartcobertura")
+QUEUE_TOKEN = os.getenv("QUEUE_TOKEN", "")  # Token Mestre desta fila (aba "API & Integração")
+WORKER_NAME = os.getenv("WORKER_NAME", "Worker-Cobertura-01")  # Mude se rodar múltiplos
+MACHINE_NAME = socket.gethostname()  # Hostname automático
 
-# --- VARIÁVEIS DE AMBIENTE DO ROBÔ (cadastradas no painel, por worker) ---
+# --- VARIÁVEIS DE AMBIENTE DO ROBÔ (lidas do painel, não de .env local) ---
 # Chaves que ESTE robô precisa para funcionar. O painel descobre a lista pelo
 # header X-Worker-Vars-Keys a cada chamada e segura a entrega de tarefas
-# (HTTP 400) enquanto alguma delas estiver sem valor para este worker.
-# O valor é sempre específico de cada robô, nunca compartilhado na fila.
+# (HTTP 400) enquanto alguma chave obrigatória estiver sem valor para este
+# worker. O valor é sempre específico de cada robô, nunca compartilhado na fila.
+#
+# Obrigatória x opcional é decisão DESTE script, não do painel: um toggle
+# manual do "Obrig." no painel dura só até o próximo poll deste robô.
 REQUIRED_ENV_KEYS = ["vivo_user", "vivo_senha", "email_user", "email_senha"]
+OPTIONAL_ENV_KEYS = []  # usadas se preenchidas, mas não bloqueiam o robô
 
 def extrair_credenciais(env_vars: dict) -> dict:
     """Normaliza as credenciais que vieram junto da tarefa.
@@ -130,282 +136,121 @@ def get_local_ip():
 
 MACHINE_IP = get_local_ip()
 
+# (conexão, leitura) em segundos. Leitura de 30s: se o painel demorar mais que o
+# timeout para responder o get-next-task, a tarefa já foi separada para este robô
+# mas nunca chega nele — um timeout curto demais transforma lentidão em tarefa presa.
+HTTP_TIMEOUT = (5, 30)
+
+# Sem tarefa por este tempo, o navegador é fechado para poupar recursos. A
+# sessão do Siebel expiraria de qualquer jeito, e o login é refeito sozinho
+# quando a próxima tarefa chegar. (O painel responde 204 SEM corpo tanto para
+# "fila vazia" quanto para "fora do horário", então não dá para distinguir os
+# dois pela resposta — o tempo ocioso cobre ambos.)
+FECHAR_NAVEGADOR_OCIOSO_SEG = 15 * 60
+
+SIEBEL_HOME_URL = os.getenv(
+    "LOGIN_REDIRECT_URL",
+    "https://vivovendas.vivo.com.br/sales_ext/start.swe?SWECmd=GotoView&SWEView=NV+Dealer+Home+Page+View&SWERF=1&SWEHo=vivovendas.vivo.com.br&SWEBU=1"
+)
+# A view de cobertura precisa estar ativa no servidor antes do NVSearchAddress
+# funcionar (equivale a clicar no ícone "Validar Cobertura" na UI).
+COVERAGE_VIEW_URL = "https://vivovendas.vivo.com.br/sales_ext/start.swe?SWECmd=GotoView&SWEView=NV+Check+Address+Coverage+Only+View+-+Dealer"
+
+# Status devolvidos em `status_consulta`. Endereço não encontrado e CEP
+# inválido são RESPOSTAS da consulta (success: true), não falhas do robô:
+# reprocessar a tarefa daria sempre o mesmo resultado.
+STATUS_DISPONIVEL = "DISPONIVEL"                    # tem tecnologia e porta livre
+STATUS_SEM_DISPONIBILIDADE = "SEM_DISPONIBILIDADE"  # tem rede (ex: GPON), mas nenhuma porta livre
+STATUS_SEM_COBERTURA = "SEM_COBERTURA"              # endereço existe, nenhuma tecnologia de acesso
+STATUS_MULTIPLOS = "MULTIPLOS_ENDERECOS"            # CEP genérico: várias ruas, sem logradouro p/ escolher
+STATUS_NAO_ENCONTRADO = "ENDERECO_NAO_ENCONTRADO"
+STATUS_CEP_INVALIDO = "CEP_INVALIDO"
+
+
+class SessaoSiebelPerdida(Exception):
+    """A sessão logada caiu (redirecionou para o login ou o SiebelApp sumiu).
+    O loop principal refaz o login e tenta a mesma tarefa mais uma vez."""
+
+
 def handle_command(command, driver=None):
     """Executa comandos recebidos do painel de controle."""
     print(f"\n🎮 Comando recebido do painel: {command}")
-    
+
     if command == "restart_worker":
         print("🔄 Reiniciando worker...")
         if driver:
             try: driver.quit()
             except: pass
         os.execv(sys.executable, [sys.executable] + sys.argv)
-    
+
     elif command == "shutdown_pc":
         print("🔴 Desligando computador em 30 segundos...")
         if driver:
             try: driver.quit()
             except: pass
         if platform.system() == "Windows":
-            subprocess.Popen(["shutdown", "/s", "/t", "30", "/c", 
+            subprocess.Popen(["shutdown", "/s", "/t", "30", "/c",
                 "Worker Dashboard: desligamento remoto solicitado."])
         else:
-            subprocess.Popen(["sudo", "shutdown", "-h", "+1", 
+            subprocess.Popen(["sudo", "shutdown", "-h", "+1",
                 "Worker Dashboard: desligamento remoto solicitado."])
         sys.exit(0)
-    
+
     elif command == "restart_pc":
         print("🟠 Reiniciando computador em 30 segundos...")
         if driver:
             try: driver.quit()
             except: pass
         if platform.system() == "Windows":
-            subprocess.Popen(["shutdown", "/r", "/t", "30", "/c", 
+            subprocess.Popen(["shutdown", "/r", "/t", "30", "/c",
                 "Worker Dashboard: reinício remoto solicitado."])
         else:
             subprocess.Popen(["sudo", "reboot"])
         sys.exit(0)
 
-def extrair_megas(texto: str) -> str:
+    elif command == "disable":
+        # Servidor já marcou este worker como inativo no painel (fora do horário
+        # de operação, desligamento automático) — só encerra o processo local.
+        # O bootstrap.ps1 religa o script depois; enquanto o worker estiver
+        # desativado no painel, a API responde 401 e ele só fica aguardando.
+        print("⏹️ Worker desativado remotamente (fora do horário de operação). Encerrando processo...")
+        if driver:
+            try: driver.quit()
+            except: pass
+        sys.exit(0)
+
+
+def send_result(task_id, post_data, headers):
     """
-    Extrai a quantidade de megas/velocidade a partir de um texto (nome do produto, promoção ou tecnologia).
-    Ex: 'Vivo Fibra 500 Mega' -> '500 Mega'
-        'Banda Larga 1 Giga' -> '1000 Mega'
-        'Plano 300MB' -> '300 Mega'
+    Entrega o resultado ao painel, tentando de novo se a rede falhar.
+
+    Sem isso, um timeout ou erro 5xx no complete-task perdia o resultado em
+    silêncio e a tarefa ficava presa como "Em Processamento" para sempre (o
+    robô continua ativo, então o painel nunca a devolve para a fila). Repetir
+    é seguro: tarefa já finalizada responde 200 com "already_finished".
     """
-    if not texto:
-        return ""
-    
-    # 1. Procura por padrões de Giga (ex: 1 Giga, 1GB, 1 Gbps, 2.5 Giga)
-    giga_match = re.search(r'(\d+(?:[\.,]\d+)?)\s*(?:giga|gigas|gbps|gb)\b', texto, re.IGNORECASE)
-    if giga_match:
-        val_str = giga_match.group(1).replace(',', '.')
+    for attempt in range(1, 6):
         try:
-            val = float(val_str)
-            if val < 10:
-                return f"{int(val * 1000)} Mega"
-            return f"{int(val)} Mega"
-        except ValueError:
-            pass
+            response = requests.post(
+                f"{BASE_URL}/api/complete-task/{task_id}/",
+                headers=headers,
+                json=post_data,
+                timeout=HTTP_TIMEOUT
+            )
+            if response.status_code == 200:
+                return True
+            if 400 <= response.status_code < 500 and response.status_code not in (408, 429):
+                # 403: a tarefa já não é deste robô (voltou para a fila por
+                # inatividade); 400: corpo inválido. Repetir não muda nada.
+                print(f"\n❌ Resultado da tarefa #{task_id} recusado ({response.status_code}): {response.text[:300]}")
+                return False
+            print(f"\n⚠️ Painel respondeu {response.status_code} ao entregar #{task_id} (tentativa {attempt}/5)")
+        except requests.exceptions.RequestException as e:
+            print(f"\n⚠️ Falha ao entregar #{task_id} (tentativa {attempt}/5): {e}")
+        time.sleep(5 * attempt)
+    print(f"\n❌ Não foi possível entregar o resultado da tarefa #{task_id}.")
+    return False
 
-    # 2. Procura por padrões de Mega/MB/Mbps (ex: 500 Mega, 500MB, 500Mbps)
-    mega_match = re.search(r'(\d+)\s*(?:mega|megas|mbps|mb)\b', texto, re.IGNORECASE)
-    if mega_match:
-        return f"{mega_match.group(1)} Mega"
-
-    # 3. Procura por M isolado (ex: 500M, 600 M)
-    m_match = re.search(r'(\d+)\s*m\b', texto, re.IGNORECASE)
-    if m_match:
-        return f"{m_match.group(1)} Mega"
-
-    return ""
-
-def format_result(cnpj: str, company_name: str, company_address: str, account_id: str, product_records: list) -> list:
-    """
-    Formata o resultado no schema plano consolidado esperado pelo Dashboard centralizador,
-    incluindo nome_plano e megas.
-    """
-    extraido_em = datetime.now().isoformat()
-    
-    # Se a empresa não tiver produtos ativos, retorna uma linha com os dados da empresa e colunas de produtos vazias
-    if not product_records:
-        return [{
-            "cnpj": cnpj,
-            "nome": company_name,
-            "endereco_completo": company_address,
-            "id_conta": account_id,
-            "extraido_em": extraido_em,
-            "id": None,
-            "id_integracao": None,
-            "nome_produto": None,
-            "status": None,
-            "data_criacao": None,
-            "data_instalacao": None,
-            "numero_serie": None,
-            "quantidade": None,
-            "nome_promocao": None,
-            "id_pai": None,
-            "nivel_hierarquia": None,
-            "fidelizacao": None,
-            "tecnologia_acesso": None,
-            "tecnologia_voz": None,
-            "endereco_servico": None,
-            "nome_plano": None,
-            "megas": None
-        }]
-        
-    products_by_id = {str(p.get("Id")): p for p in product_records if p.get("Id")}
-
-    def obter_nome_plano(r):
-        # 1. Tenta nome da promoção do próprio registro
-        prom = r.get("Prod Prom Name")
-        if prom and str(prom).strip():
-            return str(prom).strip()
-
-        # 2. Procura nos ancestrais
-        curr = r
-        visited = set()
-        while curr:
-            pid = str(curr.get("Parent Id") or curr.get("GVT Parent Hierarchy Item Id") or "")
-            if not pid or pid == "-1" or pid in visited:
-                break
-            visited.add(pid)
-            curr = products_by_id.get(pid)
-            if curr and curr.get("Prod Prom Name") and str(curr.get("Prod Prom Name")).strip():
-                return str(curr.get("Prod Prom Name")).strip()
-
-        # 3. Fallback para nome do produto
-        return r.get("GVT Product Name Calc", "") or ""
-
-    def obter_megas(r):
-        # 1. Tenta no próprio produto
-        for campo in ["GVT Product Name Calc", "Prod Prom Name", "GVT Display Access Technology"]:
-            val = extrair_megas(r.get(campo, ""))
-            if val:
-                return val
-
-        # 2. Tenta nos filhos se for produto pai
-        prod_id = str(r.get("Id", ""))
-        if prod_id:
-            for child in product_records:
-                c_parent = str(child.get("Parent Id") or child.get("GVT Parent Hierarchy Item Id") or "")
-                if c_parent == prod_id:
-                    for campo in ["GVT Product Name Calc", "Prod Prom Name", "GVT Display Access Technology"]:
-                        val = extrair_megas(child.get(campo, ""))
-                        if val:
-                            return val
-
-        # 3. Tenta no pai se for produto filho
-        parent_id = str(r.get("Parent Id") or r.get("GVT Parent Hierarchy Item Id") or "")
-        if parent_id and parent_id != "-1" and parent_id in products_by_id:
-            p_prod = products_by_id[parent_id]
-            for campo in ["GVT Product Name Calc", "Prod Prom Name", "GVT Display Access Technology"]:
-                val = extrair_megas(p_prod.get(campo, ""))
-                if val:
-                    return val
-
-        return ""
-
-    formatted_list = []
-    for r in product_records:
-        parent_id = str(r.get("Parent Id", "")) if r.get("Parent Id") != -1 else ""
-        level = r.get("Hierarchy Level", 0)
-        
-        nome_plano = obter_nome_plano(r)
-        megas = obter_megas(r)
-        
-        formatted_list.append({
-            "cnpj": cnpj,
-            "nome": company_name,
-            "endereco_completo": company_address,
-            "id_conta": account_id,
-            "extraido_em": extraido_em,
-            "id": r.get("Id", ""),
-            "id_integracao": r.get("Integration Id", ""),
-            "nome_produto": r.get("GVT Product Name Calc", ""),
-            "status": r.get("GVT Status", ""),
-            "data_criacao": r.get("Created", ""),
-            "data_instalacao": r.get("GVT Install Date", ""),
-            "numero_serie": r.get("Serial Number", ""),
-            "quantidade": r.get("Quantity", ""),
-            "nome_promocao": r.get("Prod Prom Name", ""),
-            "id_pai": parent_id,
-            "nivel_hierarquia": int(level) if level is not None else 0,
-            "fidelizacao": r.get("GVT Commitment Calc", ""),
-            "tecnologia_acesso": r.get("GVT Display Access Technology", ""),
-            "tecnologia_voz": r.get("GVT Display Voice Technology", ""),
-            "endereco_servico": r.get("GVT Service Address", ""),
-            "nome_plano": nome_plano,
-            "megas": megas
-        })
-    return formatted_list
-
-def process_task(driver, payload: dict, config: dict = None) -> list:
-    """
-    Recebe o payload da tarefa (CNPJ) e faz a extração de dados no Siebel.
-    Retorna uma lista de registros consolidados.
-    """
-    # Recupera o CNPJ do payload da forma mais flexível possível
-    cnpj = payload.get("cnpj") or payload.get("CNPJ")
-    if not cnpj and isinstance(payload, str):
-        cnpj = payload
-        
-    if not cnpj:
-        raise ValueError("Payload da tarefa inválido: CNPJ não encontrado.")
-        
-    # Limpa formatação e preenche zeros à esquerda
-    cnpj = ''.join(filter(str.isdigit, str(cnpj))).zfill(14)
-    cnpj_fmt = f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
-    print(f"\n🔍 Processando CNPJ: {cnpj_fmt}")
-    
-    # Inicializa cliente da API Siebel
-    api = SiebelAPIClient(driver)
-    
-    # Busca empresa no Siebel
-    result = api.search_cnpj(cnpj)
-    
-    if result.get("error"):
-        raise RuntimeError(f"Erro retornado pela API Siebel: {result['error']}")
-        
-    empresa = result.get("empresa")
-    if not empresa:
-        print("  ⚠ Cliente não encontrado no Siebel. Retornando pesquisa como completa sem produtos.")
-        return format_result(cnpj, "N/A", "N/A", "N/A", [])
-        
-    name = empresa.get("name", "")
-    address = empresa.get("address", "")
-    acc_id = empresa.get("id", "")
-    
-    print(f"  ✔ Empresa: {name}")
-    
-    # Expande árvore de produtos
-    produtos_raiz = result.get("produtos", [])
-    if produtos_raiz:
-        print(f"  → Expandindo {len(produtos_raiz)} produtos raiz...")
-        all_products = api.expand_all_recursive(acc_id, produtos_raiz)
-        print(f"  ✔ {len(all_products)} produto(s) extraído(s) com sucesso.")
-    else:
-        all_products = []
-        print("  ⚠ Nenhum produto ativo encontrado.")
-        
-    # Formata e retorna no padrão unificado
-    return format_result(cnpj, name, address, acc_id, all_products)
-
-def process_coverage_task(driver, payload: dict) -> dict:
-    """
-    Recebe o payload da tarefa (CNPJ, CEP e número) e verifica se o endereço
-    tem cobertura GPON no Siebel. Retorna um dict simples com o resultado,
-    sem o schema completo de produtos usado em process_task.
-    """
-    cnpj = payload.get("cnpj") or payload.get("CNPJ") or ""
-    cep = payload.get("cep") or payload.get("CEP")
-    numero = payload.get("numero") or payload.get("Numero") or payload.get("numero_imovel")
-    cidade = payload.get("cidade") or payload.get("Cidade") or ""
-    estado = payload.get("estado") or payload.get("Estado") or ""
-
-    if not cep or not numero:
-        raise ValueError("Payload da tarefa inválido: CEP e/ou número não encontrados.")
-
-    print(f"\n📡 Verificando cobertura GPON: CEP={cep} Nº={numero}")
-
-    # Garante que a view de cobertura está ativa no servidor antes do
-    # NVSearchAddress funcionar (equivale a clicar no ícone "Validar Cobertura").
-    coverage_view_url = "https://vivovendas.vivo.com.br/sales_ext/start.swe?SWECmd=GotoView&SWEView=NV+Check+Address+Coverage+Only+View+-+Dealer"
-    driver.get(coverage_view_url)
-    time.sleep(3.0)
-
-    api = SiebelAPIClient(driver)
-    api.search_coverage(cep, numero, cidade, estado)
-    detalhes = api.check_coverage_details()
-
-    print(f"  ✔ GPON: {detalhes['is_gpon']}")
-
-    return {
-        "cnpj": cnpj,
-        "cep": cep,
-        "numero": numero,
-        "is_gpon": detalhes["is_gpon"],
-    }
 
 def verificar_erro_siebel(driver):
     """
@@ -425,42 +270,488 @@ def verificar_erro_siebel(driver):
         pass
     return False
 
-def wait_for_siebel_ready(driver, timeout=30):
+
+def abrir_sessao_siebel(credenciais):
     """
-    Aguarda até que o portal Siebel não esteja mais ocupado (classe 'siebui-busy' no HTML)
-    e que nenhum elemento 'loader' esteja visível na tela.
+    Abre o Chrome, faz o login (captcha + OTP) e deixa o navegador numa view
+    do Siebel. Retorna o driver pronto, ou None se não conseguiu (o loop
+    principal tenta de novo na próxima tarefa).
     """
+    print("\n[Navegador] Inicializando navegador...")
+    start_browser()
+    driver = connect_browser()
+    _driver_ativo["driver"] = driver
     if not driver:
-        return
+        print("  ✖ Falha ao iniciar o Chrome. Verifique se o Google Chrome está instalado/atualizado.")
+        return None
+    print("  ✔ Conectado ao navegador com sucesso!")
+
     try:
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            html_el = driver.find_element(By.TAG_NAME, "html")
-            classes = html_el.get_attribute("class") or ""
-            
-            # Verifica se existem loaders visíveis
-            loaders = driver.find_elements(By.CLASS_NAME, "loader")
-            loader_visible = any(l.is_displayed() for l in loaders)
-            
-            if "siebui-busy" not in classes and not loader_visible:
-                time.sleep(1.0)
-                break
-            time.sleep(0.5)
-    except:
-        pass
+        current_url = driver.current_url
+        if "simplifiquevivoemp.com.br" not in current_url and "SWEView" not in current_url:
+            print("  [Auth] O navegador não está na área logada. Iniciando Auto-Login...")
+            if not loginVivo(driver, credenciais):
+                print("  ✖ Falha no Auto-Login. Fechando navegador e limpando sessão...")
+                fechar_navegador(driver)
+                return None
+            print("  ✔ Auto-Login realizado com sucesso!")
+
+        # Cai na tela do Siebel (onde o objeto JS SiebelApp existe). Retenta se
+        # o portal responder com a tela de "servidor ocupado".
+        if "SWEView" not in driver.current_url:
+            for attempt in range(1, 4):
+                print(f"  → Redirecionando para o Siebel (Tentativa {attempt}/3)...")
+                driver.get(SIEBEL_HOME_URL)
+                time.sleep(5.0)
+                if not verificar_erro_siebel(driver):
+                    break
+                print(f"  ⚠ Erro 'Servidor Ocupado' detectado na tentativa {attempt}.")
+                if attempt == 3:
+                    print("  🚨 Erro do Siebel persistiu após todas as tentativas. Reiniciando navegador...")
+                    fechar_navegador(driver)
+                    return None
+                time.sleep(10)
+    except Exception as e:
+        print(f"  ⚠ Erro ao fazer login ou redirecionar: {e}")
+        fechar_navegador(driver)
+        return None
+
+    return driver
+
+
+def fechar_navegador(driver):
+    if driver:
+        try: driver.quit()
+        except: pass
+    _driver_ativo["driver"] = None
+
+
+COVERAGE_VIEW_NAME = "NV Check Address Coverage Only View - Dealer"
+
+
+def _view_cobertura_ativa(driver):
+    """
+    Pergunta ao próprio Siebel qual view está ativa. A URL do navegador NÃO
+    serve para isso: o Open UI é uma página única e, testado ao vivo, a barra
+    de endereço seguia mostrando a Home enquanto a view ativa já era a de
+    cobertura (e a busca funcionava normalmente).
+
+    Sem `verificar_erro_siebel` aqui: ele procura textos como "SBL-" na página
+    inteira, e a própria view de cobertura pode exibir uma mensagem assim (erro
+    da consulta anterior) — dava falso "sessão perdida" e relogin à toa. Com o
+    Siebel fora do ar/ocupado não existe view ativa, então esta checagem já
+    cobre esse caso.
+    """
+    try:
+        ativa = driver.execute_script(
+            "try { return SiebelApp.S_App.GetActiveView().GetName(); } catch (e) { return ''; }"
+        ) or ""
+    except Exception:
+        ativa = ""
+    if ativa != COVERAGE_VIEW_NAME:
+        print(f"  [Siebel] view ativa: '{ativa or '-'}'")
+    return ativa == COVERAGE_VIEW_NAME
+
+
+def abrir_view_cobertura(driver, passar_pela_home=False):
+    """
+    Deixa a view de cobertura ativa no servidor e devolve o cliente da API.
+
+    O Siebel às vezes "reseta" o contexto e manda de volta para a Home
+    (GotoView "NV Dealer Home Page View"): o GotoView da cobertura cai na
+    Home, ou a busca volta sem dados. Isso NÃO é logout — passar pela Home e
+    reabrir a cobertura resolve, sem refazer captcha + OTP. Só se ainda assim
+    não abrir é que a sessão é dada como perdida (-> relogin).
+    """
+    if passar_pela_home:
+        driver.get(SIEBEL_HOME_URL)
+        time.sleep(4.0)
+    driver.get(COVERAGE_VIEW_URL)
+    time.sleep(3.0)
+    if not _view_cobertura_ativa(driver):
+        print("  ⚠ View de cobertura não ficou ativa no Siebel. Reabrindo pela Home...")
+        driver.get(SIEBEL_HOME_URL)
+        time.sleep(4.0)
+        driver.get(COVERAGE_VIEW_URL)
+        time.sleep(3.0)
+        if not _view_cobertura_ativa(driver):
+            raise SessaoSiebelPerdida("View de cobertura não ficou ativa no Siebel nem após passar pela Home")
+    try:
+        return SiebelAPIClient(driver)
+    except ValueError as e:
+        raise SessaoSiebelPerdida(str(e))
+
+
+def _salvar_resposta_crua(nome, body):
+    """Guarda a resposta SWE de um caso anômalo em logs/ para diagnóstico."""
+    try:
+        seguro = re.sub(r'[^\w.-]', '_', nome)
+        caminho = os.path.join(_LOG_DIR, f"{datetime.now():%Y%m%d_%H%M%S}_{seguro}.txt")
+        with open(caminho, "w", encoding="utf-8") as f:
+            f.write(body or "")
+        print(f"  📝 Resposta crua salva em {caminho}")
+    except Exception as e:
+        print(f"  ⚠ Não foi possível salvar a resposta crua: {e}")
+
+
+def _texto_comparavel(texto) -> str:
+    """Maiúsculo, sem acento e sem pontuação, para casar nomes de rua."""
+    texto = unicodedata.normalize("NFKD", str(texto or "")).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r'[^A-Z0-9 ]', ' ', texto.upper()).split()
+
+
+# Tipos de logradouro em qualquer grafia: "R", "RUA", "AV", "AVENIDA"... Fora
+# da comparação porque o Siebel abrevia ("R QUINZE DE NOVEMBRO") e a planilha
+# de entrada costuma vir por extenso ("Rua Quinze de Novembro").
+_TIPOS_LOGRADOURO = {
+    "R", "RUA", "AV", "AVENIDA", "AL", "ALAMEDA", "TV", "TRAV", "TRAVESSA", "PC", "PCA",
+    "PRACA", "EST", "ESTRADA", "ROD", "RODOVIA", "VIA", "VL", "VILA", "LGO", "LARGO", "DE", "DA", "DO", "DAS", "DOS",
+}
+
+
+def _rua_e_cep(endereco):
+    texto = endereco.get("Endereco") or ""
+    cep = re.search(r'CEP\s*(\d{8})', texto)
+    # "AV PAULISTA|EDI:MUSEU DE ARTE SAO PAULO" -> "AV PAULISTA": o sufixo após
+    # "|" é o nome do edifício; duas linhas do mesmo prédio só diferem nele.
+    rua = texto.split(",")[0].split("|")[0]
+    return " ".join(_texto_comparavel(rua)), (cep.group(1) if cep else "")
+
+
+def escolher_endereco(enderecos, logradouro, cep):
+    """
+    Índice da linha a consultar quando a busca devolve mais de uma, ou None
+    se não der para decidir com segurança.
+
+    CEP genérico de cidade pequena devolve várias ruas para o mesmo número
+    (ex: 13525000 nº 100 -> 9 endereços); sem o nome da rua não há como saber
+    qual é o do cliente, e consultar a 1ª linha às cegas devolveria a
+    cobertura de outro endereço. Ordem de desempate:
+      1. logradouro do payload (se veio) filtra as ruas que casam;
+      2. entre as que sobraram, a de CEP idêntico ao pedido;
+      3. se todas as que sobraram são a MESMA rua no MESMO CEP, a primeira.
+    """
+    candidatos = list(range(len(enderecos)))
+    alvo = [p for p in _texto_comparavel(logradouro) if p not in _TIPOS_LOGRADOURO]
+    if alvo:
+        candidatos = [i for i in candidatos
+                      if all(p in _rua_e_cep(enderecos[i])[0].split() for p in alvo)]
+    if len(candidatos) == 1:
+        return candidatos[0]
+    if not candidatos:
+        return None
+
+    mesmo_cep = [i for i in candidatos if _rua_e_cep(enderecos[i])[1] == cep]
+    if len(mesmo_cep) == 1:
+        return mesmo_cep[0]
+
+    restantes = mesmo_cep or candidatos
+    if len({_rua_e_cep(enderecos[i]) for i in restantes}) == 1:
+        return restantes[0]
+    return None
+
+
+def normalizar_cep(valor) -> str:
+    """Só dígitos; CEP com 7 dígitos ganha o zero à esquerda que o Excel come."""
+    digitos = re.sub(r'\D', '', str(valor or ""))
+    if len(digitos) == 7:
+        digitos = digitos.zfill(8)
+    return digitos
+
+
+def normalizar_numero(valor) -> str:
+    """'1180.0' (número lido de planilha) vira '1180'; o resto só é aparado."""
+    if isinstance(valor, float) and valor.is_integer():
+        return str(int(valor))
+    texto = str(valor if valor is not None else "").strip()
+    if re.fullmatch(r'\d+\.0+', texto):
+        texto = texto.split('.')[0]
+    return texto
+
+
+def _consultar_cobertura(driver, payload):
+    """
+    Consulta a cobertura de UM endereço (CEP + número) no Siebel.
+
+    Recebe:
+      - payload (dict): {"cep": "13419230", "numero": "1180", "logradouro": ""}
+                        (só cep e numero são obrigatórios; logradouro desempata
+                        CEP genérico que devolve várias ruas)
+      - config (dict): `default_config` da fila (não usado hoje)
+      - env_vars (dict): credenciais deste worker cadastradas no painel
+    Retorna:
+      - dict (1 para 1) sempre com as MESMAS chaves, seja qual for o status,
+        para as colunas OUT_ do painel e do CSV ficarem alinhadas.
+
+    Endereço não encontrado / CEP inválido NÃO levantam exceção: são a
+    resposta da consulta. Só erro de verdade (sessão, rede, Siebel fora)
+    vira exceção -> tarefa FAILED.
+    """
+    cep = normalizar_cep(payload.get("cep") or payload.get("CEP"))
+    numero = normalizar_numero(payload.get("numero") or payload.get("Numero") or payload.get("numero_imovel"))
+    # cidade/estado do payload NÃO vão para o Siebel: o padrão é só CEP +
+    # número, e na validação um caso com cidade preenchida voltou sem a busca
+    # executada. O CEP já determina a cidade.
+    # Opcional: só é usado para escolher a rua quando o CEP devolve várias.
+    logradouro = str(payload.get("logradouro") or payload.get("rua") or payload.get("Logradouro") or "").strip()
+
+    if not numero:
+        raise ValueError("Payload da tarefa inválido: número do endereço não informado.")
+
+    resultado = {
+        "cep": cep,
+        "numero": numero,
+        "status_consulta": "",
+        "endereco_encontrado": False,
+        "disponivel": False,
+        "is_gpon": False,
+        "tecnologia_acesso": "",
+        "velocidade_maxima": "",
+        "portas_disponiveis": 0,
+        "faixas_velocidade": "",
+        "linhas_telefonicas": 0,
+        "cobertura_movel": "",
+        "tecnologia_tv": "",
+        "mensagem": "",
+        "endereco": "",
+        "cep_retornado": "",
+        "cep_divergente": False,
+        "bairro": "",
+        "rede": "",
+        "tipo_cidade": "",
+        "intervalo": "",
+        "tipo_armario": "",
+        "velocidade_maxima_armario": "",
+        "caixa": "",
+        "central_primaria": "",
+        "area_telefonica": "",
+        "estacao": "",
+        "enderecos_encontrados": 0,
+        "enderecos_candidatos": "",
+        "detalhes_cobertura": "",
+        "consultado_em": datetime.now().isoformat(timespec="seconds"),
+    }
+
+    # Mesma regra do próprio Siebel ("O número deve ter apenas 8 dígitos
+    # numéricos"), checada antes para não gastar uma ida ao portal.
+    if len(cep) != 8:
+        resultado["status_consulta"] = STATUS_CEP_INVALIDO
+        resultado["mensagem"] = f"CEP inválido: '{payload.get('cep') or payload.get('CEP') or ''}' (precisa ter 8 dígitos)."
+        print(f"  ⚠ {resultado['mensagem']}")
+        return resultado
+
+    print(f"\n📡 Verificando cobertura: CEP={cep} Nº={numero}")
+
+    api = abrir_view_cobertura(driver)
+
+    busca = api.search_coverage(cep, numero)
+    if not busca["enderecos"] and not busca.get("erro"):
+        # Status Completed sem nenhuma linha e sem ErrMsg: não é a resposta
+        # normal de "não encontrado" (essa vem com erro). Já aconteceu com um
+        # endereço que existe e que na busca seguinte voltou normal — então
+        # reabre a view e refaz uma vez antes de concluir qualquer coisa.
+        _salvar_resposta_crua(f"busca_vazia_{cep}_{numero}", api.ultima_resposta)
+        print("  ⚠ Busca voltou vazia sem mensagem de erro. Refazendo a consulta uma vez...")
+        time.sleep(2.0)
+        api = abrir_view_cobertura(driver, passar_pela_home=True)
+        busca = api.search_coverage(cep, numero)
+    enderecos = busca["enderecos"]
+    resultado["enderecos_encontrados"] = len(enderecos)
+
+    if busca.get("erro"):
+        erro = busca["erro"]
+        if "não encontrado" in erro.lower() or "nao encontrado" in erro.lower():
+            resultado["status_consulta"] = STATUS_NAO_ENCONTRADO
+        elif "cep" in erro.lower() and "inválido" in erro.lower():
+            resultado["status_consulta"] = STATUS_CEP_INVALIDO
+        else:
+            raise RuntimeError(f"Erro retornado pelo Siebel na busca do endereço: {erro}")
+        resultado["mensagem"] = erro
+        print(f"  ⚠ {erro}")
+        return resultado
+
+    if not enderecos:
+        # Sem linha E sem ErrMsg, duas vezes: o Siebel não executou a busca
+        # (resposta só com estado de tela). NÃO é "endereço não existe" — esse
+        # veredito só vale quando o próprio Siebel diz "Endereço não encontrado".
+        # Falha a tarefa (reprocessável) em vez de gravar uma resposta falsa.
+        _salvar_resposta_crua(f"busca_vazia_{cep}_{numero}_retry", api.ultima_resposta)
+        raise RuntimeError("Siebel não executou a busca (resposta sem endereços e sem mensagem de erro, 2 tentativas).")
+
+    if len(enderecos) > 1:
+        resultado["enderecos_candidatos"] = " || ".join(
+            f"{e.get('Endereco', '')} [{e.get('Tecnologia Acesso') or 'sem tecnologia'}]" for e in enderecos
+        )
+        indice = escolher_endereco(enderecos, logradouro, cep)
+        if indice is None:
+            tecnologias = sorted({e.get("Tecnologia Acesso") for e in enderecos if e.get("Tecnologia Acesso")})
+            resultado.update({
+                "status_consulta": STATUS_MULTIPLOS,
+                "endereco_encontrado": True,
+                "tecnologia_acesso": ", ".join(tecnologias),
+                "mensagem": (f"{len(enderecos)} endereços para este CEP e número. Informe 'logradouro' "
+                             f"na tarefa para consultar a cobertura do endereço certo."
+                             + (f" Logradouro '{logradouro}' não casou com um único candidato." if logradouro else "")),
+            })
+            print(f"  ⚠ {resultado['mensagem']}")
+            return resultado
+    else:
+        indice = 0
+
+    # O NVCheckCoverage consulta a linha passada em SWERowId (VRId-<n>).
+    selecionado = enderecos[indice]
+    detalhes = api.check_coverage_details(selecionado.get("Id") or f"VRId-{indice}")
+    notas = detalhes["notas"]
+    fields = detalhes["fields"]
+
+    endereco_txt = selecionado.get("Endereco", "")
+    cep_match = re.search(r'CEP\s*(\d{8})', endereco_txt)
+    cep_retornado = cep_match.group(1) if cep_match else ""
+
+    resultado.update({
+        "endereco_encontrado": True,
+        "disponivel": notas["disponivel"],
+        "is_gpon": detalhes["is_gpon"],
+        "tecnologia_acesso": fields.get("GVT Access Technology Calc") or selecionado.get("Tecnologia Acesso", ""),
+        "velocidade_maxima": notas["velocidade_maxima"],
+        "portas_disponiveis": notas["portas_disponiveis"],
+        "faixas_velocidade": notas["faixas_velocidade"],
+        "linhas_telefonicas": notas["linhas_telefonicas"],
+        "cobertura_movel": fields.get("NV Mobile Coverage Flag", ""),
+        "tecnologia_tv": notas["tecnologia_tv"],
+        "tipo_cidade": notas["tipo_cidade"],
+        "tipo_armario": notas["tipo_armario"],
+        "velocidade_maxima_armario": notas["velocidade_maxima_armario"],
+        "caixa": notas["caixa"],
+        "central_primaria": notas["central_primaria"],
+        "area_telefonica": fields.get("telephonicArea") or selecionado.get("AT", ""),
+        "estacao": fields.get("microArea") or selecionado.get("ES", ""),
+        # Texto integral das notas do Siebel, uma informação por linha, para
+        # conferência humana de qualquer detalhe que não virou coluna própria.
+        "detalhes_cobertura": "\n".join(
+            l for l in (x.replace("\xa0", " ").strip(" -;\t")
+                        for x in re.split(r'\r?\n', fields.get("GVT Coverage Notes", "")))
+            if l
+        ),
+        "mensagem": f"{notas['codigo_mensagem']} {notas['mensagem']}".strip(),
+        "endereco": endereco_txt,
+        "cep_retornado": cep_retornado,
+        # O Siebel casa o número pela faixa do logradouro: um número que não
+        # existe no CEP informado pode voltar num CEP vizinho da mesma rua.
+        "cep_divergente": bool(cep_retornado) and cep_retornado != cep,
+        "bairro": selecionado.get("Bairro", ""),
+        "rede": fields.get("donoRede") or selecionado.get("Rede", ""),
+        "intervalo": selecionado.get("Intervalo", ""),
+    })
+    if notas["disponivel"]:
+        resultado["status_consulta"] = STATUS_DISPONIVEL
+    elif resultado["tecnologia_acesso"]:
+        resultado["status_consulta"] = STATUS_SEM_DISPONIBILIDADE
+    else:
+        resultado["status_consulta"] = STATUS_SEM_COBERTURA
+
+    print(f"  ✔ {resultado['status_consulta']} | {resultado['tecnologia_acesso']} | "
+          f"{resultado['velocidade_maxima'] or '-'} | portas={resultado['portas_disponiveis']}"
+          + (f" | CEP retornado {cep_retornado} ≠ {cep}" if resultado["cep_divergente"] else ""))
+    return resultado
+
+
+# --- Camada "leiga" do resultado ---
+# Os campos técnicos (status_consulta, tecnologia_acesso, GPON, I2402...) são o
+# contrato estável para filtros e para a tela; estes três são o que um vendedor
+# ou cliente entende sem conhecer a rede: rótulo curto, frase explicativa e a
+# tecnologia pelo nome comercial.
+SITUACAO_LEIGA = {
+    STATUS_DISPONIVEL: "Disponível",
+    STATUS_SEM_DISPONIBILIDADE: "Sem vaga no momento",
+    STATUS_SEM_COBERTURA: "Sem cobertura",
+    STATUS_MULTIPLOS: "Várias ruas neste CEP",
+    STATUS_NAO_ENCONTRADO: "Endereço não encontrado",
+    STATUS_CEP_INVALIDO: "CEP inválido",
+}
+
+TECNOLOGIA_LEIGA = {
+    "GPON": "Fibra óptica",
+    "METALICO": "Cabo de cobre",
+    "FTTC": "Fibra até o armário + cabo de cobre",
+    "HFC": "Cabo coaxial",
+}
+
+
+def velocidade_leiga(velocidade):
+    """'1 Gbps' -> '1 Giga', '500 Mbps' -> '500 Mega' (como o cliente fala)."""
+    m = re.match(r'\s*([\d.,]+)\s*([GMK])bps', velocidade or "", re.IGNORECASE)
+    if not m:
+        return velocidade or ""
+    unidade = {"G": "Giga", "M": "Mega", "K": "Kbps"}[m.group(2).upper()]
+    return f"{m.group(1)} {unidade}"
+
+
+def descrever_tecnologia(codigo):
+    if not codigo:
+        return ""
+    partes = [p.strip() for p in codigo.split(",") if p.strip()]
+    return ", ".join(TECNOLOGIA_LEIGA.get(p.upper(), p.title()) for p in partes)
+
+
+def resumo_leigo(r):
+    """Uma frase que explica o resultado sem jargão de rede."""
+    status = r["status_consulta"]
+    tec = descrever_tecnologia(r["tecnologia_acesso"]).lower() or "de internet"
+    vel = velocidade_leiga(r["velocidade_maxima"])
+
+    if status == STATUS_DISPONIVEL:
+        frase = f"Tem {tec} disponível para instalação" + (f", com velocidade de até {vel}." if vel else ".")
+    elif status == STATUS_SEM_DISPONIBILIDADE:
+        frase = (f"A rede de {tec} chega a este endereço, mas no momento não há vaga para "
+                 f"uma nova instalação. Vale consultar de novo mais tarde.")
+    elif status == STATUS_SEM_COBERTURA:
+        frase = "A Vivo não tem rede de internet fixa neste endereço."
+    elif status == STATUS_MULTIPLOS:
+        frase = (f"Este CEP é compartilhado por {r['enderecos_encontrados']} ruas com esse número. "
+                 f"Informe o nome da rua para ver a cobertura do endereço certo.")
+    elif status == STATUS_NAO_ENCONTRADO:
+        frase = "Endereço não encontrado na base da Vivo. Confira se o CEP e o número estão corretos."
+    elif status == STATUS_CEP_INVALIDO:
+        frase = "CEP inválido: ele precisa ter 8 números."
+    else:
+        frase = ""
+
+    if r.get("cep_divergente") and r.get("cep_retornado"):
+        frase += (f" Atenção: a Vivo localizou este número no CEP {r['cep_retornado'][:5]}-{r['cep_retornado'][5:]}, "
+                  f"diferente do informado.")
+    return frase.strip()
+
+
+def process_task(driver, payload, config, env_vars):
+    """
+    Consulta a cobertura de UM endereço e devolve o resultado técnico mais a
+    camada leiga (`situacao`, `resumo`, `tecnologia_descricao`), sempre com as
+    mesmas chaves. Ver `_consultar_cobertura` para a consulta em si.
+    """
+    resultado = _consultar_cobertura(driver, payload)
+    resultado["situacao"] = SITUACAO_LEIGA.get(resultado["status_consulta"], resultado["status_consulta"])
+    resultado["tecnologia_descricao"] = descrever_tecnologia(resultado["tecnologia_acesso"])
+    resultado["velocidade_maxima"] = velocidade_leiga(resultado["velocidade_maxima"])
+    resultado["resumo"] = resumo_leigo(resultado)
+    return resultado
+
 
 def run_worker():
     print(f"🚀 Iniciando Worker [{WORKER_NAME}] na fila [{QUEUE_SLUG}]...")
     print(f"💻 Máquina: {MACHINE_NAME} ({MACHINE_IP})")
     print(f"🔗 Conectando ao Dashboard em: {BASE_URL}")
 
+    if not QUEUE_TOKEN:
+        print("❌ QUEUE_TOKEN vazio no .env. Copie o Token Mestre da fila (aba 'API & Integração') para o .env.")
+        time.sleep(60)
+        sys.exit(1)
+
     print("🧹 Verificando navegadores órfãos de uma execução anterior...")
     try:
         limpar_navegadores_orfaos()
     except Exception as e:
         print(f"  ⚠ Falha ao limpar navegadores órfãos: {e}")
-
-    print("💤 Robô em modo passivo. Pingando a API aguardando horário/tarefa...")
 
     headers = {
         "X-Queue-Token": QUEUE_TOKEN,
@@ -469,19 +760,22 @@ def run_worker():
         "X-Machine-IP": MACHINE_IP,
         # Declara ao painel quais chaves este robô precisa. Enviar este header
         # é o que ativa a sincronização/validação de variáveis no servidor.
-        "X-Worker-Vars-Keys": ",".join(REQUIRED_ENV_KEYS)
+        "X-Worker-Vars-Keys": ",".join(REQUIRED_ENV_KEYS + OPTIONAL_ENV_KEYS),
+        # Dentre as chaves acima, quais são opcionais — o resto é obrigatório.
+        # Enviar isto (mesmo vazio) faz o painel obedecer estas duas listas.
+        "X-Worker-Vars-Optional-Keys": ",".join(OPTIONAL_ENV_KEYS),
     }
-    
+
     driver = None
-    first_error_time = None
     credenciais = {}
+    ultima_tarefa = time.time()
 
     while True:
         try:
-            # 1. Buscar Tarefa na fila do Dashboard (Modo Passivo)
+            # 1. Buscar Tarefa
             response = requests.get(
-                f"{BASE_URL}/api/get-next-task/{QUEUE_SLUG}/", 
-                headers=headers, timeout=10
+                f"{BASE_URL}/api/get-next-task/{QUEUE_SLUG}/",
+                headers=headers, timeout=HTTP_TIMEOUT
             )
 
             # Verificar comandos remotos em QUALQUER resposta
@@ -494,31 +788,11 @@ def run_worker():
                 pass
 
             if response.status_code == 204:
-                # Pode ser fila vazia ou fora de horário.
-                fora_do_horario = False
-                deve_desligar_pc = False
-                try:
-                    resp_data = response.json()
-                    msg = resp_data.get("message", "").lower()
-                    if "fora" in msg and "hor" in msg:
-                        fora_do_horario = True
-                    if resp_data.get("shutdown") is True:
-                        deve_desligar_pc = True
-                except Exception:
-                    pass
-
-                if fora_do_horario and driver:
-                    print("\n⏰ [Agendamento] Fora do horário de operação. Fechando navegador para poupar recursos...")
-                    try: driver.quit()
-                    except: pass
+                # Sem tarefas (ou fora do horário / em pausa), espera um pouco
+                if driver and time.time() - ultima_tarefa > FECHAR_NAVEGADOR_OCIOSO_SEG:
+                    print("\n💤 Sem tarefas há um tempo. Fechando navegador para poupar recursos...")
+                    fechar_navegador(driver)
                     driver = None
-
-                if deve_desligar_pc:
-                    print("\n🔴 [SHUTDOWN] Dashboard solicitou desligamento do PC!")
-                    handle_command("shutdown_pc", driver)
-                    return  # Encerra o loop do worker
-
-                first_error_time = None
                 print(".", end="", flush=True)
                 time.sleep(5)
                 continue
@@ -532,258 +806,90 @@ def run_worker():
                 except (json.JSONDecodeError, ValueError):
                     faltando = response.text
                 print(f"\n⚠️ Configuração pendente no painel deste worker: {faltando}")
-                if driver:
-                    try: driver.quit()
-                    except: pass
-                    driver = None
+                fechar_navegador(driver)
+                driver = None
                 time.sleep(15)
                 continue
 
             if response.status_code != 200:
-                print(f"\n❌ Erro API ({response.status_code}) - {response.text}")
-                if driver:
-                    print("[Navegador] Fechando navegador devido a status de API não-ok...")
-                    try: driver.quit()
-                    except: pass
-                    driver = None
+                print(f"\n❌ Erro API ({response.status_code}): {response.text[:300]}")
                 time.sleep(10)
                 continue
 
             task = response.json()
             task_id = task['id']
-            payload = task['payload']
+            payload = task['payload'] or {}
             config = task.get('config', {})
             env_vars = task.get('vars', {})
+            ultima_tarefa = time.time()
 
-            # Credenciais deste worker chegam junto da tarefa (única fonte).
-            novas_credenciais = extrair_credenciais(env_vars)
-            faltando = [chave for chave, valor in novas_credenciais.items() if not valor]
-            if faltando:
-                print(f"\n⚠️ Tarefa #{task_id} sem credenciais no painel deste worker: {faltando}")
-                try:
-                    requests.post(
-                        f"{BASE_URL}/api/complete-task/{task_id}/",
-                        headers=headers,
-                        json={"success": False, "result": {},
-                              "error_message": f"Credenciais nao cadastradas no painel deste worker: {faltando}"},
-                        timeout=15
-                    )
-                except Exception as post_err:
-                    print(f"  ⚠ Falha ao devolver a tarefa ao Dashboard: {post_err}")
-                if driver:
-                    try: driver.quit()
-                    except: pass
-                    driver = None
-                time.sleep(15)
-                continue
+            print(f"\n⚡ Tarefa #{task_id} recebida!")
 
-            # Se mudaram no painel, a sessão aberta está logada com a credencial
+            # Credenciais deste worker chegam junto da tarefa (única fonte). Se
+            # mudaram no painel, a sessão aberta está logada com a credencial
             # antiga e precisa ser derrubada para refazer o login.
+            novas_credenciais = extrair_credenciais(env_vars)
             if credenciais and novas_credenciais != credenciais and driver:
                 print("\n🔑 Credenciais do painel mudaram. Fechando navegador para refazer o login...")
-                try: driver.quit()
-                except: pass
+                fechar_navegador(driver)
                 driver = None
             credenciais = novas_credenciais
 
-            print(f"\n⚡ Tarefa #{task_id} recebida! Preparando ambiente do Navegador...")
-
-            # Garante conexão com o navegador Chrome ativo agora que temos uma tarefa
-            if not driver:
-                print("\n[Navegador] Inicializando navegador...")
-                start_browser()
-                print("\n[Navegador] Conectando ao navegador Chrome...")
-                driver = connect_browser()
-                _driver_ativo["driver"] = driver
-                if not driver:
-                    print("  ✖ Falha ao iniciar o Chrome. Verifique se o Google Chrome está instalado/atualizado.")
-                    print("  → Aguardando 10 segundos para tentar reconectar...")
-                    time.sleep(10)
-                    continue
-                print("  ✔ Conectado ao navegador com sucesso!")
-                
-                # Verificar se está logado e acionar Auto-Login se necessário
+            # 2. Processar (com uma nova tentativa se a sessão do Siebel caiu)
+            result, success, error_msg = {}, False, None
+            for tentativa in (1, 2, 3):
                 try:
-                    current_url = driver.current_url
-                    if "simplifiquevivoemp.com.br" not in current_url and "SWEView" not in current_url:
-                        print("  [Auth] O navegador não parece estar na área logada. Iniciando Auto-Login...")
-                        login_sucesso = loginVivo(driver, credenciais)
-                        if not login_sucesso:
-                            print("  ✖ Falha no Auto-Login. Fechando navegador e limpando sessao...")
-                            try: driver.quit()
-                            except: pass
-                            driver = None
-                            time.sleep(10)
-                            continue
+                    if not driver:
+                        driver = abrir_sessao_siebel(credenciais)
+                        if not driver:
+                            # Já aconteceu de a janela nova fechar logo após abrir
+                            # ("target window already closed"): tenta de novo em vez
+                            # de reprovar a tarefa na primeira falha de navegador.
+                            raise SessaoSiebelPerdida("Não foi possível abrir a sessão logada no Siebel (navegador/login).")
+                    result = process_task(driver, payload, config, env_vars)
+                    success, error_msg = True, None
+                    break
+                except SessaoSiebelPerdida as e:
+                    print(f"  ⚠ Sessão do Siebel perdida ({e}). Refazendo login (tentativa {tentativa}/3)...")
+                    fechar_navegador(driver)
+                    driver = None
+                    success, result, error_msg = False, {}, str(traceback.format_exc())
+                    time.sleep(5)  # dá tempo do Chrome anterior liberar o perfil
+                except Exception as e:
+                    success, result, error_msg = False, {}, str(traceback.format_exc())
+                    print(f"❌ Erro no processamento: {e}")
+                    # Navegador morto não se recupera sozinho: derruba para a
+                    # próxima tarefa abrir um novo.
+                    try:
+                        if driver:
+                            driver.execute_script("return 1")
+                    except Exception:
+                        fechar_navegador(driver)
+                        driver = None
+                    break
 
-                        print("  ✔ Auto-Login realizado com sucesso!")
-                        try:
-                            for _ in range(15):
-                                token = driver.execute_script("return localStorage.getItem('JwtToken');")
-                                if token:
-                                    print("  ✔ Token (JwtToken) identificado com sucesso no localStorage!")
-                                    time.sleep(5)
-                                    break
-                                time.sleep(2)
-                        except Exception as token_err:
-                            print(f"  ⚠ Erro ao verificar token no localStorage: {token_err}")
-
-                            
-                    # Garante que estamos na URL pós-login (Siebel) e com a aba 'Venda' ativa
-                    redirect_url = os.getenv("LOGIN_REDIRECT_URL", "https://vivovendas.vivo.com.br/sales_ext/start.swe?SWECmd=GotoView&SWEView=NV+Dealer+Home+Page+View&SWERF=1&SWEHo=vivovendas.vivo.com.br&SWEBU=1")
-                    if redirect_url:
-                        current_url = driver.current_url
-                        if "SWEView" not in current_url:
-                            max_redirect_attempts = 3
-                            for attempt in range(1, max_redirect_attempts + 1):
-                                print(f"  → Redirecionando para o Siebel (Tentativa {attempt}/{max_redirect_attempts}): {redirect_url}")
-                                driver.get(redirect_url)
-                                print("  → Aguardando o portal carregar (5 segundos)...")
-                                time.sleep(5.0)
-                                
-                                # Verifica se o Siebel retornou tela de servidor ocupado
-                                if verificar_erro_siebel(driver):
-                                    print(f"  ⚠ Erro 'Servidor Ocupado' detectado na tentativa {attempt}.")
-                                    if attempt < max_redirect_attempts:
-                                        print("  → Aguardando 10 segundos antes de tentar novamente o redirecionamento...")
-                                        time.sleep(10)
-                                        continue
-                                    else:
-                                        print("  🚨 Erro do Siebel persistiu após todas as tentativas. Reiniciando navegador...")
-                                        try: driver.quit()
-                                        except: pass
-                                        driver = None
-                                        break
-                                else:
-                                    # Sucesso no redirecionamento
-                                    break
-                            
-                            # Se o driver foi reiniciado/zerado
-                            if not driver:
-                                continue
-                        
-                        # Uma vez na página do Siebel, garante que a aba Venda está ativa com retentativas para evitar elementos obsoletos (stale elements)
-                        click_venda_success = False
-                        for attempt_click in range(1, 6):
-                            try:
-                                # Aguarda o portal estar pronto/não ocupado
-                                wait_for_siebel_ready(driver, timeout=20)
-                                
-                                # Verifica se a aba Venda está ativa
-                                venda_ativa = driver.find_elements(By.XPATH, "//li[contains(@class, 'ui-tabs-active') or @aria-selected='true']//a[normalize-space(text())='Venda' or contains(@title, 'Venda')]")
-                                if not venda_ativa:
-                                    print(f"  → Aba 'Venda' não está ativa. Procurando e clicando (Tentativa {attempt_click}/5)...")
-                                    btn_venda = WebDriverWait(driver, 10).until(
-                                        EC.element_to_be_clickable((By.XPATH, "//a[normalize-space(text())='Venda' or contains(@title, 'Venda')]"))
-                                    )
-                                    btn_venda.click()
-                                    print("  ✔ Botão/Aba 'Venda' clicada com sucesso!")
-                                    time.sleep(3.0)
-                                else:
-                                    print("  ✔ Aba 'Venda' já está ativa.")
-                                click_venda_success = True
-                                break
-                            except (StaleElementReferenceException, ElementClickInterceptedException) as click_retry_err:
-                                print(f"  ⚠ Elemento obsoleto ou interceptado ao clicar na aba 'Venda': {click_retry_err}. Retentando em 2.0s...")
-                                time.sleep(2.0)
-                            except Exception as click_err:
-                                print(f"  ⚠ Erro inesperado ao tentar clicar na aba 'Venda': {click_err}. Retentando em 2.0s...")
-                                time.sleep(2.0)
-                        
-                        if not click_venda_success:
-                            print("  🚨 Falha ao clicar na aba 'Venda' após 5 tentativas.")
-                                
-                except Exception as redir_err:
-                    print(f"  ⚠ Erro ao verificar login ou redirecionar: {redir_err}")
-            
-            # Testa se a sessão do browser ainda responde e se está livre do erro Siebel (com retentativa local)
-            try:
-                driver.execute_script("return 1")
-                if verificar_erro_siebel(driver):
-                    print("  ⚠ Erro 'Servidor Ocupado' detectado no loop principal. Tentando refresh...")
-                    driver.refresh()
-                    time.sleep(5)
-                    if verificar_erro_siebel(driver):
-                        redirect_url = os.getenv("LOGIN_REDIRECT_URL", "https://vivovendas.vivo.com.br/sales_ext/start.swe?SWECmd=GotoView&SWEView=NV+Dealer+Home+Page+View&SWERF=1&SWEHo=vivovendas.vivo.com.br&SWEBU=1")
-                        print(f"  → Servidor continua ocupado após refresh. Tentando forçar redirecionamento para {redirect_url}...")
-                        driver.get(redirect_url)
-                        time.sleep(5)
-                        if verificar_erro_siebel(driver):
-                            raise RuntimeError("Portal Siebel ocupado persistentemente")
-            except Exception as e:
-                print(f"\n[Navegador] Conexão com o navegador perdida ou erro no Siebel: {e}. Resetando driver...")
-                if driver:
-                    try: driver.quit()
-                    except: pass
-                driver = None
-                continue
-
-            # 2. Processar a Extração
-            try:
-                # Tarefa de cobertura (CEP/número) usa um fluxo separado do de CNPJ.
-                if payload.get("cep") and payload.get("numero"):
-                    result = process_coverage_task(driver, payload)
-                else:
-                    result = process_task(driver, payload, config)
-                success = True
-                error_msg = None
-            except Exception as e:
-                success = False
-                result = {}
-                error_msg = str(traceback.format_exc())
-                print(f"❌ Erro no processamento: {e}")
-
-            # 3. Enviar Resultado de volta ao Dashboard
+            # 3. Enviar Resultado
             post_data = {
                 "success": success,
                 "result": result,
                 "error_message": error_msg
             }
-            
-            requests.post(
-                f"{BASE_URL}/api/complete-task/{task_id}/",
-                headers=headers,
-                json=post_data,
-                timeout=15
-            )
-            print(f"✅ Tarefa #{task_id} finalizada com sucesso!" if success else f"⚠️ Tarefa #{task_id} reportada com erro.")
-            
-            if success:
-                first_error_time = None
-            else:
-                if not first_error_time:
-                    first_error_time = time.time()
-                elif time.time() - first_error_time > 600:
-                    print("\n🚨 ERROS PERSISTENTES POR 10 MINUTOS. REINICIANDO NAVEGADOR E FLUXO DO ZERO...")
-                    if driver:
-                        try: driver.quit()
-                        except: pass
-                        driver = None
-                    first_error_time = None
-                    time.sleep(2)
+
+            if send_result(task_id, post_data, headers):
+                print(f"✅ Tarefa #{task_id} finalizada!" if success else f"⚠️ Tarefa #{task_id} reportada com erro.")
 
         except requests.exceptions.ConnectionError:
-            print("\n⚠️ Falha de rede ao conectar ao Dashboard. Retentando em 10s...")
-            if not first_error_time: first_error_time = time.time()
-            elif time.time() - first_error_time > 600:
-                print("\n🚨 ERROS PERSISTENTES POR 10 MINUTOS. REINICIANDO NAVEGADOR E FLUXO DO ZERO...")
-                if driver:
-                    try: driver.quit()
-                    except: pass
-                    driver = None
-                first_error_time = None
+            print("\n⚠️ Falha na conexão com o Dashboard. Tentando novamente em 10s...")
+            time.sleep(10)
+        except requests.exceptions.Timeout:
+            print("\n⚠️ Painel demorou a responder. Tentando novamente em 10s...")
             time.sleep(10)
         except Exception as e:
-            print(f"\n❌ Erro no loop geral do worker: {e}")
-            if not first_error_time: first_error_time = time.time()
-            elif time.time() - first_error_time > 600:
-                print("\n🚨 ERROS PERSISTENTES POR 10 MINUTOS. REINICIANDO NAVEGADOR E FLUXO DO ZERO...")
-                if driver:
-                    try: driver.quit()
-                    except: pass
-                    driver = None
-                first_error_time = None
+            print(f"\n❌ Erro fatal no loop: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
+    # Inicialização automática: fica a cargo do setup_startup.ps1 (tarefa
+    # agendada "VivoSmartCoberturaWorker" -> bootstrap.ps1 -> este script),
+    # não do setup_autostart() do script genérico do painel.
     run_worker()

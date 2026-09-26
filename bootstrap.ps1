@@ -1,5 +1,5 @@
 # ============================================================
-#  Vivo Smart Worker - Bootstrap
+#  Vivo Smart Cobertura Worker - Bootstrap
 #  Roda a cada logon (chamado por startup_worker.vbs, oculto).
 #  Idempotente: verifica ANTES de instalar qualquer coisa.
 #

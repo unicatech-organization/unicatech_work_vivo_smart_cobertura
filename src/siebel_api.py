@@ -13,7 +13,8 @@ class SiebelAPIClient:
     """Cliente para a API SWE (Siebel Web Engine) via fetch() no browser."""
     
     BASE_URL = "https://vivovendas.vivo.com.br/sales_ext/start.swe"
-    
+    SCRIPT_TIMEOUT_SEG = 120
+
     def __init__(self, driver):
         """
         Args:
@@ -37,6 +38,11 @@ class SiebelAPIClient:
         
         self.srn = session_info.get("srn", "")
         self.swec = session_info.get("swec", 1)
+
+        # O fetch() roda via execute_async_script, cujo limite padrão do
+        # Selenium (~30s) já estourou no NVSearchAddress de CEP genérico de
+        # cidade pequena (Siebel consulta o OSP e demora). 120s cobre com folga.
+        driver.set_script_timeout(self.SCRIPT_TIMEOUT_SEG)
         
         if not self.srn:
             raise ValueError("Não foi possível extrair o SRN da sessão Siebel")
@@ -88,7 +94,8 @@ class SiebelAPIClient:
             raise RuntimeError(f"Erro na chamada API: {response.get('error')}")
         
         body = response["body"]
-        
+        self.ultima_resposta = body  # diagnóstico de respostas anômalas
+
         # Atualiza SRN e SWEC da resposta
         srn_match = re.search(r'`SRN`([^`]*)`', body)
         if srn_match and srn_match.group(1):
@@ -167,10 +174,16 @@ class SiebelAPIClient:
         }
 
         body = self._post(data)
-        enderecos = self._parse_coverage_response(body)
+
+        # CEP inexistente/inválido volta como Status`Error com ErrMsg (ex:
+        # "Endereço não encontrado.") e nenhuma linha em S_BC1. Sem ler o
+        # erro, a busca vazia era indistinguível de "existe mas não é GPON".
+        erro = self._extract_error(body)
+        enderecos = [] if erro else self._parse_coverage_response(body)
         return {
             "enderecos": enderecos,
             "is_gpon": any(e.get("Tecnologia Acesso") == "GPON" for e in enderecos),
+            "erro": erro,
         }
 
     def check_coverage_details(self, row_id: str = "VRId-0") -> dict:
@@ -202,10 +215,16 @@ class SiebelAPIClient:
         }
 
         body = self._post(data)
+        erro = self._extract_error(body)
+        if erro:
+            # Ex: "Operação inválida quando não executada.(SBL-DAT-00471)" quando
+            # nenhum endereço ficou selecionado pela busca anterior.
+            raise RuntimeError(f"NVCheckCoverage retornou erro: {erro}")
         fields = self._parse_coverage_details(body)
         return {
             "fields": fields,
             "is_gpon": fields.get("GVT Access Technology Calc") == "GPON",
+            "notas": self.parse_coverage_notes(fields.get("GVT Coverage Notes", "")),
         }
 
     def check_gpon(self, cep: str, numero: str, cidade: str = "", estado: str = "") -> bool:
@@ -213,9 +232,107 @@ class SiebelAPIClient:
         Fluxo completo: pesquisa o endereço por CEP/número e verifica se a
         tecnologia de acesso definitiva é GPON.
         """
-        self.search_coverage(cep, numero, cidade, estado)
+        busca = self.search_coverage(cep, numero, cidade, estado)
+        if not busca["enderecos"]:
+            return False
         details = self.check_coverage_details()
         return details["is_gpon"]
+
+    @staticmethod
+    def _extract_error(body: str) -> str | None:
+        """Retorna o ErrMsg de uma resposta SWE com Status`Error, ou None."""
+        if not re.search(r'`Status`Error`', body):
+            return None
+        match = re.search(r'`ErrMsg`([^`]*)`', body)
+        return match.group(1).strip() if match else "Erro sem mensagem retornado pelo Siebel"
+
+    @staticmethod
+    def parse_coverage_notes(notas: str) -> dict:
+        """
+        Extrai o que importa do texto livre "GVT Coverage Notes" do NVCheckCoverage.
+
+        A tecnologia sozinha engana: um endereço pode ser GPON e mesmo assim
+        não ter porta livre ("I2238 Indisponibilidade de Banda Downstream na
+        Porta da OLT", todas as quantidades 0). A disponibilidade real vem do
+        código da primeira linha (I2402 = há disponibilidade) e das
+        quantidades por faixa de velocidade.
+        """
+        resultado = {
+            "codigo_mensagem": "",
+            "mensagem": "",
+            "disponivel": False,
+            "portas_disponiveis": 0,
+            "velocidade_maxima": "",
+            "velocidade_maxima_armario": "",
+            "caixa": "",
+            "faixas_velocidade": "",
+            "linhas_telefonicas": 0,
+            "tipo_cidade": "",
+            "tipo_armario": "",
+            "tecnologia_tv": "",
+            "central_primaria": "",
+        }
+        if not notas:
+            return resultado
+
+        texto = notas.replace("\xa0", " ")
+        linhas = [l.strip(" -;\t") for l in re.split(r'\r?\n', texto)]
+
+        for linha in linhas:
+            m = re.match(r'(I\d{3,5})\s+(.*)', linha)
+            if m:
+                resultado["codigo_mensagem"] = m.group(1)
+                resultado["mensagem"] = re.sub(r'\s+', ' ', m.group(2)).strip()
+                break
+        if not resultado["mensagem"]:
+            # Sem código Ixxxx a explicação vem logo após "Mensagem:" (na mesma
+            # linha ou na seguinte), ex: "RTB => ESB.1.1.ERR.020 - ... erro: 586
+            # - Endereço não encontrado - Atributos inválidos ou não informados."
+            m = re.search(r'Mensagem:\s*;?\s*(.*?)\s*(?:\r?\n\s*-?\s*Linha Telef|$)', texto, re.DOTALL)
+            if m:
+                resultado["mensagem"] = re.sub(r'\s+', ' ', m.group(1)).strip(" ;-")
+
+        # Faixas de banda larga: "De 51 a 1 Gbps: 42; Velocidade máxima 1 Gbps; ..."
+        # A última faixa com quantidade > 0 é a velocidade máxima vendável.
+        for linha in linhas:
+            m = re.match(r'(?:At[ée]|De)\b.*?:\s*(\d+)\s*(?:;(.*))?$', linha)
+            if not m or int(m.group(1)) <= 0:
+                continue
+            resultado["portas_disponiveis"] = max(resultado["portas_disponiveis"], int(m.group(1)))
+            vel = re.search(r'Velocidade m[áa]xima\s+([\d.,]+\s*[GMK]bps)', m.group(2) or "", re.IGNORECASE)
+            if vel:
+                resultado["velocidade_maxima"] = vel.group(1)
+
+        armario = re.search(r'Velocidade M[áa]xima do arm[áa]rio:\s*(\d*)', texto, re.IGNORECASE)
+        if armario:
+            resultado["velocidade_maxima_armario"] = armario.group(1)
+        caixa = re.search(r'Caixa:\s*([^;\r\n]*)', texto)
+        if caixa:
+            resultado["caixa"] = caixa.group(1).strip()
+
+        # Faixas de banda larga com a quantidade de cada uma, em texto plano
+        # ("Até 20Mbps: 42 | De 21 a 50Mbps: 42 | ..."), para leitura direta
+        # na coluna do painel/CSV.
+        faixas = []
+        for linha in linhas:
+            m = re.match(r'((?:At[ée]|De)\b[^:]*):\s*(\d+)', linha)
+            if m:
+                faixas.append(f"{m.group(1).strip()}: {m.group(2)}")
+        resultado["faixas_velocidade"] = " | ".join(faixas)
+
+        def _campo(rotulo):
+            m = re.search(rf'{rotulo}:\s*([^;\r\n]*)', texto, re.IGNORECASE)
+            return m.group(1).strip() if m else ""
+
+        linhas_tel = re.search(r'Linha Telef[ôo]nica;.*?Quantidade:\s*(\d+)', texto, re.IGNORECASE | re.DOTALL)
+        resultado["linhas_telefonicas"] = int(linhas_tel.group(1)) if linhas_tel else 0
+        resultado["tipo_cidade"] = _campo(r'Cidade')              # On Net / Off Net
+        resultado["tipo_armario"] = _campo(r'Tipo arm[áa]rio')
+        resultado["tecnologia_tv"] = _campo(r'Tecnologia de TV')
+        resultado["central_primaria"] = _campo(r'Central Prim[áa]ria')
+
+        resultado["disponivel"] = resultado["portas_disponiveis"] > 0
+        return resultado
 
     def expand_product(self, product_row_id: str, account_row_id: str) -> list:
         """
@@ -369,12 +486,7 @@ class SiebelAPIClient:
         ]
 
         result = []
-        matches = re.finditer(
-            r'OP`iw`bc`S_BC1`1`0`FieldValues`0`ValueArray`(.*?)`',
-            body
-        )
-        for match in matches:
-            values = self._parse_value_array(match.group(1))
+        for values in self._value_arrays(body, 'OP`iw`bc`S_BC1`1`0`FieldValues`0`ValueArray`'):
             if len(values) > 1 and values[1]:  # Ignora linhas vazias
                 endereco = {}
                 for i, field in enumerate(coverage_fields):
@@ -451,6 +563,31 @@ class SiebelAPIClient:
                         product[field] = values[i]
                 result["produtos"].append(product)
     
+    @staticmethod
+    def _value_arrays(body: str, prefixo: str):
+        """
+        Lê cada ValueArray que segue `prefixo` pelo COMPRIMENTO de cada valor
+        (formato N*valor), parando no primeiro caractere que não inicia um novo
+        N* (a crase que fecha o array).
+
+        Recortar com regex `(.*?)` até a próxima crase falhava quando um valor
+        tinha quebra de linha (ex: o campo Mensagem do endereço vindo "\\r\\n"):
+        `.` não casa com \\n, a linha inteira era descartada e um endereço
+        existente virava "não encontrado".
+        """
+        for match in re.finditer(re.escape(prefixo), body):
+            pos = match.end()
+            values = []
+            while True:
+                m = re.match(r'(\d+)\*', body[pos:pos + 12])
+                if not m:
+                    break
+                inicio = pos + m.end()
+                fim = inicio + int(m.group(1))
+                values.append(body[inicio:fim])
+                pos = fim
+            yield values
+
     @staticmethod
     def _parse_value_array(raw: str) -> list:
         """

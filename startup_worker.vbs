@@ -1,5 +1,5 @@
 ' ============================================================
-'  Vivo Smart Worker - Launcher oculto
+'  Vivo Smart Cobertura Worker - Launcher oculto
 '  Chamado pela Tarefa Agendada no logon. Executa o
 '  bootstrap.ps1 em segundo plano, SEM nenhuma janela.
 ' ============================================================
