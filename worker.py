@@ -676,7 +676,10 @@ def _consultar_cobertura(driver, payload):
         "disponivel": notas["disponivel"],
         "is_gpon": tecnologia_confirmada.upper() == "GPON",
         "tecnologia_acesso": tecnologia_confirmada,
-        "velocidade_maxima": notas["velocidade_maxima"],
+        # A velocidade máxima permanece apenas em `detalhes_cobertura`, no
+        # texto integral da Vivo. O campo estruturado fica vazio por
+        # compatibilidade com integrações/CSV que já conhecem esta chave.
+        "velocidade_maxima": "",
         "portas_disponiveis": notas["portas_disponiveis"],
         "faixas_velocidade": notas["faixas_velocidade"],
         "linhas_telefonicas": notas["linhas_telefonicas"],
@@ -684,7 +687,7 @@ def _consultar_cobertura(driver, payload):
         "tecnologia_tv": notas["tecnologia_tv"],
         "tipo_cidade": notas["tipo_cidade"],
         "tipo_armario": notas["tipo_armario"],
-        "velocidade_maxima_armario": notas["velocidade_maxima_armario"],
+        "velocidade_maxima_armario": "",
         "caixa": notas["caixa"],
         "central_primaria": notas["central_primaria"],
         "area_telefonica": fields.get("telephonicArea") or selecionado.get("AT", ""),
@@ -762,10 +765,8 @@ def resumo_leigo(r):
     """Uma frase que explica o resultado sem jargão de rede."""
     status = r["status_consulta"]
     tec = descrever_tecnologia(r["tecnologia_acesso"]).lower() or "de internet"
-    vel = velocidade_leiga(r["velocidade_maxima"])
-
     if status == STATUS_DISPONIVEL:
-        frase = f"Tem {tec} disponível para instalação" + (f", com velocidade de até {vel}." if vel else ".")
+        frase = f"Tem {tec} disponível para instalação."
     elif status == STATUS_SEM_DISPONIBILIDADE:
         frase = (f"A rede de {tec} chega a este endereço, mas no momento não há vaga para "
                  f"uma nova instalação. Vale consultar de novo mais tarde.")
@@ -796,7 +797,6 @@ def process_task(driver, payload, config, env_vars):
     resultado = _consultar_cobertura(driver, payload)
     resultado["situacao"] = SITUACAO_LEIGA.get(resultado["status_consulta"], resultado["status_consulta"])
     resultado["tecnologia_descricao"] = descrever_tecnologia(resultado["tecnologia_acesso"])
-    resultado["velocidade_maxima"] = velocidade_leiga(resultado["velocidade_maxima"])
     resultado["resumo"] = resumo_leigo(resultado)
     return resultado
 
