@@ -102,8 +102,10 @@ if hasattr(signal, "SIGBREAK"):
 BASE_URL = os.getenv("API_BASE_URL", "http://192.168.100.2/workers").rstrip('/')  # URL do seu Dashboard
 QUEUE_SLUG = os.getenv("QUEUE_SLUG", "vivosmartcobertura")
 QUEUE_TOKEN = os.getenv("QUEUE_TOKEN", "")  # Token Mestre desta fila (aba "API & Integração")
-WORKER_NAME = os.getenv("WORKER_NAME", "Worker-Cobertura-01")  # Mude se rodar múltiplos
 MACHINE_NAME = socket.gethostname()  # Hostname automático
+# `{machine}` deixa o mesmo .env versionado funcionar em vários PCs sem que
+# todos se apresentem ao painel como a mesma instância.
+WORKER_NAME = os.getenv("WORKER_NAME", "Worker-Cobertura-{machine}").replace("{machine}", MACHINE_NAME)
 
 # --- VARIÁVEIS DE AMBIENTE DO ROBÔ (lidas do painel, não de .env local) ---
 # Chaves que ESTE robô precisa para funcionar. O painel descobre a lista pelo
@@ -329,7 +331,7 @@ def fechar_navegador(driver):
 COVERAGE_VIEW_NAME = "NV Check Address Coverage Only View - Dealer"
 
 
-def _view_cobertura_ativa(driver):
+def _view_cobertura_ativa(driver, timeout=10.0):
     """
     Pergunta ao próprio Siebel qual view está ativa. A URL do navegador NÃO
     serve para isso: o Open UI é uma página única e, testado ao vivo, a barra
@@ -341,16 +343,26 @@ def _view_cobertura_ativa(driver):
     da consulta anterior) — dava falso "sessão perdida" e relogin à toa. Com o
     Siebel fora do ar/ocupado não existe view ativa, então esta checagem já
     cobre esse caso.
+
+    Espera ATIVA (checa a cada 0,5 s, até `timeout`) em vez de um sleep fixo:
+    segue assim que o Siebel termina de montar a view (normalmente < 1 s) e
+    ainda tolera um Siebel lento sem dar falso "sessão perdida".
     """
-    try:
-        ativa = driver.execute_script(
-            "try { return SiebelApp.S_App.GetActiveView().GetName(); } catch (e) { return ''; }"
-        ) or ""
-    except Exception:
-        ativa = ""
-    if ativa != COVERAGE_VIEW_NAME:
-        print(f"  [Siebel] view ativa: '{ativa or '-'}'")
-    return ativa == COVERAGE_VIEW_NAME
+    fim = time.time() + timeout
+    ativa = ""
+    while True:
+        try:
+            ativa = driver.execute_script(
+                "try { return SiebelApp.S_App.GetActiveView().GetName(); } catch (e) { return ''; }"
+            ) or ""
+        except Exception:
+            ativa = ""
+        if ativa == COVERAGE_VIEW_NAME:
+            return True
+        if time.time() >= fim:
+            print(f"  [Siebel] view ativa: '{ativa or '-'}'")
+            return False
+        time.sleep(0.5)
 
 
 def abrir_view_cobertura(driver, passar_pela_home=False):
@@ -367,13 +379,11 @@ def abrir_view_cobertura(driver, passar_pela_home=False):
         driver.get(SIEBEL_HOME_URL)
         time.sleep(4.0)
     driver.get(COVERAGE_VIEW_URL)
-    time.sleep(3.0)
     if not _view_cobertura_ativa(driver):
         print("  ⚠ View de cobertura não ficou ativa no Siebel. Reabrindo pela Home...")
         driver.get(SIEBEL_HOME_URL)
         time.sleep(4.0)
         driver.get(COVERAGE_VIEW_URL)
-        time.sleep(3.0)
         if not _view_cobertura_ativa(driver):
             raise SessaoSiebelPerdida("View de cobertura não ficou ativa no Siebel nem após passar pela Home")
     try:
@@ -382,8 +392,23 @@ def abrir_view_cobertura(driver, passar_pela_home=False):
         raise SessaoSiebelPerdida(str(e))
 
 
+RETENCAO_RESPOSTAS_CRUAS_DIAS = 14  # mesma retenção dos logs do loguru
+
+
 def _salvar_resposta_crua(nome, body):
-    """Guarda a resposta SWE de um caso anômalo em logs/ para diagnóstico."""
+    """
+    Guarda a resposta SWE de um caso anômalo em logs/ para diagnóstico.
+    Apaga as mais velhas que a retenção: a do loguru só cobre worker_*.log, e
+    sem isto um robô rodando por meses acumularia arquivos sem limite.
+    """
+    try:
+        limite = time.time() - RETENCAO_RESPOSTAS_CRUAS_DIAS * 86400
+        for antigo in os.listdir(_LOG_DIR):
+            caminho_antigo = os.path.join(_LOG_DIR, antigo)
+            if antigo.endswith(".txt") and os.path.getmtime(caminho_antigo) < limite:
+                os.remove(caminho_antigo)
+    except Exception:
+        pass
     try:
         seguro = re.sub(r'[^\w.-]', '_', nome)
         caminho = os.path.join(_LOG_DIR, f"{datetime.now():%Y%m%d_%H%M%S}_{seguro}.txt")
