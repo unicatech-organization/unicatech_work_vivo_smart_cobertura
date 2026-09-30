@@ -169,6 +169,38 @@ STATUS_NAO_ENCONTRADO = "ENDERECO_NAO_ENCONTRADO"
 STATUS_CEP_INVALIDO = "CEP_INVALIDO"
 
 
+def _texto_sem_acento(valor):
+    return unicodedata.normalize("NFKD", str(valor or "")).encode("ascii", "ignore").decode("ascii").lower()
+
+
+def classificar_cobertura(disponivel, tecnologia_detalhe, tecnologia_busca="", mensagem="", codigo=""):
+    """
+    Decide o status pela resposta definitiva do NVCheckCoverage.
+
+    ``Mensagem: Sem Cobertura`` significa que não existe rede no imóvel, mesmo
+    que algum campo auxiliar sugira GPON. ``Endereço Saturado``/I2238 confirma
+    rede existente sem porta. A mensagem do detalhe é mais autoritativa que a
+    tecnologia indicativa devolvida pela busca de endereços.
+    """
+    detalhe = str(tecnologia_detalhe or "").strip()
+    indicativa = str(tecnologia_busca or "").strip()
+    if disponivel:
+        return STATUS_DISPONIVEL, detalhe or indicativa
+
+    texto_mensagem = _texto_sem_acento(mensagem)
+    if "sem cobertura" in texto_mensagem:
+        return STATUS_SEM_COBERTURA, ""
+    if (
+        "saturado" in texto_mensagem
+        or "indisponibilidade de banda" in texto_mensagem
+        or str(codigo or "").strip().upper() == "I2238"
+    ):
+        return STATUS_SEM_DISPONIBILIDADE, detalhe or indicativa
+    if detalhe:
+        return STATUS_SEM_DISPONIBILIDADE, detalhe
+    return STATUS_SEM_COBERTURA, ""
+
+
 class SessaoSiebelPerdida(Exception):
     """A sessão logada caiu (redirecionou para o login ou o SiebelApp sumiu).
     O loop principal refaz o login e tenta a mesma tarefa mais uma vez."""
@@ -628,6 +660,12 @@ def _consultar_cobertura(driver, payload):
     detalhes = api.check_coverage_details(selecionado.get("Id") or f"VRId-{indice}")
     notas = detalhes["notas"]
     fields = detalhes["fields"]
+    tecnologia_detalhe = fields.get("GVT Access Technology Calc", "")
+    tecnologia_busca = selecionado.get("Tecnologia Acesso", "")
+    status_consulta, tecnologia_confirmada = classificar_cobertura(
+        notas["disponivel"], tecnologia_detalhe, tecnologia_busca,
+        notas["mensagem"], notas["codigo_mensagem"]
+    )
 
     endereco_txt = selecionado.get("Endereco", "")
     cep_match = re.search(r'CEP\s*(\d{8})', endereco_txt)
@@ -636,8 +674,8 @@ def _consultar_cobertura(driver, payload):
     resultado.update({
         "endereco_encontrado": True,
         "disponivel": notas["disponivel"],
-        "is_gpon": detalhes["is_gpon"],
-        "tecnologia_acesso": fields.get("GVT Access Technology Calc") or selecionado.get("Tecnologia Acesso", ""),
+        "is_gpon": tecnologia_confirmada.upper() == "GPON",
+        "tecnologia_acesso": tecnologia_confirmada,
         "velocidade_maxima": notas["velocidade_maxima"],
         "portas_disponiveis": notas["portas_disponiveis"],
         "faixas_velocidade": notas["faixas_velocidade"],
@@ -668,12 +706,13 @@ def _consultar_cobertura(driver, payload):
         "rede": fields.get("donoRede") or selecionado.get("Rede", ""),
         "intervalo": selecionado.get("Intervalo", ""),
     })
-    if notas["disponivel"]:
-        resultado["status_consulta"] = STATUS_DISPONIVEL
-    elif resultado["tecnologia_acesso"]:
-        resultado["status_consulta"] = STATUS_SEM_DISPONIBILIDADE
-    else:
-        resultado["status_consulta"] = STATUS_SEM_COBERTURA
+    resultado["status_consulta"] = status_consulta
+
+    if tecnologia_busca and tecnologia_busca != tecnologia_detalhe:
+        print(
+            f"  [Cobertura] tecnologia indicativa da busca='{tecnologia_busca}', "
+            f"confirmada no detalhe='{tecnologia_detalhe or '-'}'"
+        )
 
     print(f"  ✔ {resultado['status_consulta']} | {resultado['tecnologia_acesso']} | "
           f"{resultado['velocidade_maxima'] or '-'} | portas={resultado['portas_disponiveis']}"
